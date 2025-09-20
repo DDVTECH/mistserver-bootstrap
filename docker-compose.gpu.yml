@@ -1,0 +1,14 @@
+services:
+  mist:
+    # Enable NVIDIA GPUs when the host has the NVIDIA Container Toolkit installed.
+    # Docker Compose v2.3+ supports the "gpus" key natively.
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    # Intel Quick Sync / VA-API passthrough (ignored on systems without /dev/dri).
+    devices:
+      - /dev/dri:/dev/dri
+    # Uncomment the following lines if your distro gates /dev/dri behind the "render" group.
+    # group_add:
+    #   - 107  # Replace with your render group's GID (getent group render)
