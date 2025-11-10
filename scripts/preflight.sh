@@ -35,6 +35,11 @@ sanitize_domain() {
 }
 
 domain_clean="$(sanitize_domain "${domain_raw}")"
+# If a domain is provided, implicitly require Caddy checks
+if [ -n "${domain_clean}" ]; then
+  enable_caddy="true"
+  log "DOMAIN provided; forcing Caddy-related checks."
+fi
 if [ -n "${domain_raw}" ]; then
   log "DOMAIN provided: '${domain_raw}' (sanitized -> '${domain_clean}')"
 else
