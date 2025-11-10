@@ -41,6 +41,8 @@ services:
     container_name: caddy
     depends_on:
       - mist
+    profiles:
+      - caddy
     volumes:
       - ./scripts:/scripts:ro
       - caddy-data:/data

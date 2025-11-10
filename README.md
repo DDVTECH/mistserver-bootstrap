@@ -11,37 +11,67 @@ Cloneable example that bundles MistServer, Prometheus, and Grafana with ready-to
 
 ## Quick start
 
-### macOS / Windows (published ports)
+### Local (Linux / macOS / Windows)
 ```bash
 docker compose up --build
 ```
-Services become available at:
-- MistController UI: http://localhost:4242 (default credentials `admin`/`admin`).
-- MistPlayer: http://localhost:8080/{stream}.html
-- RTMP ingest: rtmp://localhost:1935/live/{stream}
-- Prometheus: http://localhost:9090
-- Grafana (admin/admin): http://localhost:3000
+> Linux environment is recommended, but Docker Desktop works too. This starts only the core services (Mist, Prometheus, Grafana, etc.) and publishes their ports directly. Caddy is disabled by default so ports 80/443 stay free. You can enable it using: `docker compose --profile caddy up --build`, or set `COMPOSE_PROFILES=caddy` in `.env` if you always want the proxy running.
+
+| Service | URL / Endpoint | Notes |
+| --- | --- | --- |
+| MistController UI | http://localhost:4242 | Defaults to `admin` / `admin` unless overridden via env. |
+| MistPlayer templates | http://localhost:8080/{stream}.html | Replace `{stream}` with `vod`, `live`, `push`, etc. |
+| RTMP ingest | rtmp://localhost:1935/live/{stream} | Push FLV/RTMP inputs (obs → `live/{stream}`). |
+| Prometheus | http://localhost:9090 | Scrapes Mist metrics every 10 s. |
+| Grafana | http://localhost:3000 | Default login `admin` / `admin`; auto-provisioned dashboard. |
+
+#### Optional local reverse proxy (no domain)
+Want friendlier URLs without buying a domain? Start the Caddy profile on plain HTTP:
+
+```bash
+docker compose --profile caddy up --build
+```
+
+This keeps the published ports above, but also serves:
+- `http://localhost/mist/` (plus `http://localhost/mist/ws`)
+- `http://localhost/view/`, `http://localhost/hls/`, `http://localhost/webrtc/`
+- `http://localhost/grafana/`
+
+Set `COMPOSE_PROFILES=caddy` in `.env` if you always want this proxy when running `docker compose up`.
 
 ### Optional domain + HTTPS (Caddy)
 1) Copy `env.example` to project root as `.env` and set at least `DOMAIN` (e.g. `stream.example.com`).  
 2) Point DNS for `DOMAIN` to this host and open ports 80/443.  
-3) Start normally: `docker compose up --build`
+3) Start with the Caddy profile enabled:
+   ```bash
+   docker compose --profile caddy up --build
+   ```
+   (Or set `COMPOSE_PROFILES=caddy` in `.env` so a plain `docker compose up` also starts Caddy.)
 
 When `DOMAIN` is set, Caddy will terminate TLS and proxy:
-- `https://$DOMAIN/mist/` → Mist admin/API
-- `wss://$DOMAIN/mist/ws` → Mist admin WebSocket
-- `https://$DOMAIN/view/` → Mist viewer endpoints (incl. WebSocket upgrades)
-- `https://$DOMAIN/hls/` → HLS with CORS
-- `https://$DOMAIN/webrtc/` → WebRTC
-- `https://$DOMAIN/grafana/` → Grafana UI
 
-If `DOMAIN` is not set, Caddy serves HTTP on `:80` with the same paths.
+| Public path | Backend | Notes |
+| --- | --- | --- |
+| `https://$DOMAIN/mist/` | MistController UI (port 4242) | Admin/API surface. |
+| `wss://$DOMAIN/mist/ws` | MistController WebSocket | Live stats/socket UI channel. |
+| `https://$DOMAIN/view/` | Mist viewer endpoints (port 8080) | Handles WebSocket upgrades for DRM/dev panels. |
+| `https://$DOMAIN/hls/` | Mist HLS | Served with permissive CORS headers. |
+| `https://$DOMAIN/webrtc/` | Mist WebRTC | Signalling + media for browsers. |
+| `https://$DOMAIN/grafana/` | Grafana (port 3000) | Served from `/grafana/` sub-path. |
+
+If `DOMAIN` is unset but you run the `caddy` profile, it still exposes the same paths on plain HTTP (`http://localhost/...`) alongside the direct service ports above.
 
 ### Optional GPU passthrough (Linux only)
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 ```
 `docker-compose.gpu.yml` grants the container access to NVIDIA GPUs (`gpus: all`) when the NVIDIA Container Toolkit is installed, and exposes `/dev/dri` for Intel Quick Sync / VA-API. If your distribution restricts `/dev/dri` to the `render` group, edit the commented `group_add` line with your render group GID (`getent group render`). Docker Desktop on macOS/Windows does not expose host GPUs to Linux containers, so this override has no effect there.
+
+Need both GPU access **and** the reverse proxy? Just add the profile flag:
+
+```bash
+docker compose --profile caddy -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
 
 ## Working with MistServer
 - Default streams:
