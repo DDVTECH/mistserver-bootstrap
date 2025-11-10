@@ -9,10 +9,12 @@ RUN apt-get update \
        python3 \
        python3-pip \
        ninja-build \
+       cmake \
        pkg-config \
        libssl-dev \
        libcurl4-openssl-dev \
        libmicrohttpd-dev \
+       libmbedtls-dev \
        liblzma-dev \
        libbz2-dev \
        libzstd-dev \
@@ -45,6 +47,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates \
        curl \
+       bash \
+       jq \
        ffmpeg \
        libavcodec58 \
        libavfilter7 \
@@ -54,6 +58,7 @@ RUN apt-get update \
        libswscale5 \
        libssl3 \
        libcurl4 \
+       libmbedtls14 \
        libmicrohttpd12 \
        libuv1 \
        libxml2 \

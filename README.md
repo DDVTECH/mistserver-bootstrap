@@ -9,10 +9,6 @@ Cloneable example that bundles MistServer, Prometheus, and Grafana with ready-to
 - Prometheus configured to scrape MistServer metrics and Grafana auto-provisioned with a baseline dashboard and Prometheus datasource.
 - Default `--shm-size=1gb` to avoid the 64 MB Docker shared-memory limit.
 
-## Requirements
-- Docker Engine 24+ and Docker Compose Plugin 2.20+.
-- At least ~4 GB free RAM (MistServer build plus Grafana/Prometheus).
-
 ## Quick start
 
 ### macOS / Windows (published ports)
@@ -26,6 +22,21 @@ Services become available at:
 - Prometheus: http://localhost:9090
 - Grafana (admin/admin): http://localhost:3000
 
+### Optional domain + HTTPS (Caddy)
+1) Copy `env.example` to project root as `.env` and set at least `DOMAIN` (e.g. `stream.example.com`).  
+2) Point DNS for `DOMAIN` to this host and open ports 80/443.  
+3) Start normally: `docker compose up --build`
+
+When `DOMAIN` is set, Caddy will terminate TLS and proxy:
+- `https://$DOMAIN/mist/` → Mist admin/API
+- `wss://$DOMAIN/mist/ws` → Mist admin WebSocket
+- `https://$DOMAIN/view/` → Mist viewer endpoints (incl. WebSocket upgrades)
+- `https://$DOMAIN/hls/` → HLS with CORS
+- `https://$DOMAIN/webrtc/` → WebRTC
+- `https://$DOMAIN/grafana/` → Grafana UI
+
+If `DOMAIN` is not set, Caddy serves HTTP on `:80` with the same paths.
+
 ### Optional GPU passthrough (Linux only)
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
@@ -37,7 +48,7 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
   - `vod`: on-demand playback from assets in `assets/vod/`.
   - `live`: simulated livestream using ffmpeg
   - `push`: stream ready to accept RTMP inputs
-- Metrics are exposed at `http://localhost:4242/telemetry`. Prometheus scrapes this endpoint every 10 seconds.
+- Metrics are exposed at `http://localhost:4242/metrics`. Prometheus scrapes this endpoint every 10 seconds.
 
 ## Simulating live sources
 - To emit a synthetic FFmpeg test signal to the stream named 'push':
@@ -52,6 +63,14 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
   ```
 - On the MistController UI (http://localhost:4242) you can view the stream and some basic QoE metrics
 - The embedded MistPlayer allows you to seamlessly switch between protocols, like WebRTC: http://localhost:8080/push.html?dev=1
+
+## Env-driven Mist config
+On container start, a small script rewrites `configs/mistserver.conf` from environment:
+- `ADMIN_USER` / `ADMIN_PASSWORD` (password stored as MD5)
+- `BANDWIDTH_EXCLUDE_LOCAL` and optional `BANDWIDTH_LIMIT_MBIT`
+- `LOCATION_NAME`, `LOCATION_LAT`, `LOCATION_LON`
+- `PROMETHEUS_PATH` (defaults to `metrics`)
+- If `DOMAIN` is set, HTTP pub addresses and WebRTC `pubhost` are updated accordingly
 
 ## Grafana provisioning
 Grafana loads the `MistServer Overview` dashboard automatically. Start with the example panels (target status, scrape duration, latest metrics) and extend the queries as you explore the Mist metrics namespace. To import community dashboards, drop the JSON in `grafana/dashboards` and restart Grafana.

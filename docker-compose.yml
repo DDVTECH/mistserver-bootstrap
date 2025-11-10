@@ -5,6 +5,16 @@ services:
     image: mistserver-bootstrap
     container_name: mist
     shm_size: 1gb
+    environment:
+      DOMAIN: ${DOMAIN:-}
+      ADMIN_USER: ${ADMIN_USER:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      BANDWIDTH_EXCLUDE_LOCAL: ${BANDWIDTH_EXCLUDE_LOCAL:-}
+      BANDWIDTH_LIMIT_MBIT: ${BANDWIDTH_LIMIT_MBIT:-}
+      LOCATION_NAME: ${LOCATION_NAME:-}
+      LOCATION_LAT: ${LOCATION_LAT:-}
+      LOCATION_LON: ${LOCATION_LON:-}
+      PROMETHEUS_PATH: ${PROMETHEUS_PATH:-}
     volumes:
       - ./configs/mistserver.conf:/etc/mistserver.conf:rw
       - ./assets/vod:/video:rw
@@ -17,11 +27,30 @@ services:
       - "5554:5554"
       - "6200:6200"
       - "8889:8889/udp"
+      - "18203:18203/udp"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:4242/telemetry"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:4242/metrics"]
       interval: 30s
       timeout: 5s
       retries: 5
+    networks:
+      - monitoring
+
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    depends_on:
+      - mist
+    volumes:
+      - ./scripts:/scripts:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    command: ["/bin/sh", "-lc", "sh /scripts/gen_caddyfile.sh && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"]
     networks:
       - monitoring
 
@@ -49,6 +78,9 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/mist-overview.json
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SERVER_DOMAIN: ${DOMAIN:-localhost}
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
@@ -64,6 +96,8 @@ volumes:
   mist-data:
   prometheus-data:
   grafana-data:
+  caddy-data:
+  caddy-config:
 
 networks:
   monitoring:
