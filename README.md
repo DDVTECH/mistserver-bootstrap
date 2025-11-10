@@ -25,6 +25,8 @@ docker compose up --build
 | Prometheus | http://localhost:9090 | Scrapes Mist metrics every 10 s. |
 | Grafana | http://localhost:3000 | Default login `admin` / `admin`; auto-provisioned dashboard. |
 
+---
+
 #### Optional local reverse proxy (no domain)
 Want friendlier URLs without buying a domain? Start the Caddy profile on plain HTTP:
 
@@ -39,7 +41,9 @@ This keeps the published ports above, but also serves:
 
 Set `COMPOSE_PROFILES=caddy` in `.env` if you always want this proxy when running `docker compose up`.
 
-### Optional domain + HTTPS (Caddy)
+---
+
+#### Optional domain + HTTPS (Caddy)
 1) Copy `env.example` to project root as `.env` and set at least `DOMAIN` (e.g. `stream.example.com`).  
 2) Point DNS for `DOMAIN` to this host and open ports 80/443.  
 3) Start with the Caddy profile enabled:
@@ -61,6 +65,8 @@ When `DOMAIN` is set, Caddy will terminate TLS and proxy:
 
 If `DOMAIN` is unset but you run the `caddy` profile, it still exposes the same paths on plain HTTP (`http://localhost/...`) alongside the direct service ports above.
 
+---
+
 ### Optional GPU passthrough (Linux only)
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
@@ -72,6 +78,43 @@ Need both GPU access **and** the reverse proxy? Just add the profile flag:
 ```bash
 docker compose --profile caddy -f docker-compose.yml -f docker-compose.gpu.yml up --build
 ```
+
+## Makefile shortcuts (with preflight checks)
+Prefer a single command that sanity-checks your `.env`, domain, and port availability before starting? Use the bundled Makefile.
+
+`make up` runs `scripts/preflight.sh` by default (validates DOMAIN syntax/DNS, port 80/443 availability when Caddy is enabled, and numeric env vars). The Makefile simply wraps the raw `docker compose` commands shown here.
+
+| Command | Purpose |
+| --- | --- |
+| `make up` | Preflight + `docker compose up --build` |
+| `make down` | Stop the stack (`docker compose down`) |
+| `make logs` | Tail service logs (`docker compose logs -f`) |
+| `make ps` | Show service status |
+| `make build` | Preflight + `docker compose build` |
+| `make preflight` | Run the checks only |
+
+Supported flags (pass them alongside the command, e.g. `make up CADDY=true GPU=true DETACH=true`):
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `CADDY=true` | false | Adds the reverse-proxy profile (ports 80/443). |
+| `GPU=true` | false | Includes `docker-compose.gpu.yml` overrides (NVIDIA/VA-API). |
+| `DETACH=true` | false | Runs `docker compose up -d`. |
+| `PREFLIGHT=false` | true | Skip `scripts/preflight.sh` (not recommended unless already run). |
+
+**What preflight checks do:**
+- Sanitizes `DOMAIN`, verifies it resolves via the host resolver, and ensures at least one resolved IP matches a local interface (helps catch DNS pointing elsewhere).
+- When `CADDY=true`, confirms ports 80/443 are free and—if binding is possible—spawns a one‑shot HTTP listener on those ports, then `curl`s `http://DOMAIN/.well-known/...` to mimic ACME reachability. A failure usually means the host can’t bind the port, DNS isn’t updated yet, or port forwarding/firewall blocks traffic.
+- Validates numeric/bool env vars before `configs/mistserver.conf` is rewritten.
+
+Optional escape hatches (set as env vars only if you truly need to disable parts of the preflight):
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `SKIP_DOMAIN_DNS_CHECK=true` | false | Don’t resolve `DOMAIN`. |
+| `SKIP_DOMAIN_IP_MATCH=true` | false | Skip comparing DNS answers against local interfaces. |
+| `SKIP_PORT_CHECK=true` | false | Skip the port-80/443 availability probe. |
+| `SKIP_PORT_SELFTEST=true` | false | Skip the ACME-style listener/curl loopback. |
 
 ## Working with MistServer
 - Default streams:
