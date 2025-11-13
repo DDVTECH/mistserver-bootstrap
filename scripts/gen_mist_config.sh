@@ -25,7 +25,7 @@ fi
 
 HTTP_PUBADDR=""
 WEBRTC_PUBHOST=""
-[ -n "${DOMAIN}" ] && HTTP_PUBADDR="https://${DOMAIN}/view/" && WEBRTC_PUBHOST="${DOMAIN}"
+[ -n "${DOMAIN}" ] && HTTP_PUBADDR='["https://'"${DOMAIN}"'/view/","http://'"${DOMAIN}"':8080"]' && WEBRTC_PUBHOST="${DOMAIN}"
 
 DEFAULT_EXCEPTIONS='["::1","127.0.0.0/8","10.0.0.0/8","192.168.0.0/16","172.16.0.0/12"]'
 
@@ -83,7 +83,7 @@ fi
 jq \
   --arg admin_user "${ADMIN_USER}" \
   --arg admin_hash "${ADMIN_HASH}" \
-  --arg http_pubaddr "${HTTP_PUBADDR}" \
+  --argjson http_pubaddr "${HTTP_PUBADDR}" \
   --arg webrtc_pubhost "${WEBRTC_PUBHOST}" \
   --arg prometheus_path "${PROMETHEUS_PATH}" \
   --arg bw_exclude "${BANDWIDTH_EXCLUDE_LOCAL}" \
@@ -124,16 +124,16 @@ jq \
   | (if (($http_pubaddr|length)>0) and (.config.protocols? // null) != null
      then .config.protocols = (.config.protocols
            | map(
-               if .connector == "HTTP" then .pubaddr = [ $http_pubaddr ]
+               if .connector == "HTTP" then .pubaddr = $http_pubaddr 
                elif .connector == "WebRTC" then .pubhost = $webrtc_pubhost
                else .
                end))
      else .
      end)
-  | (if ($http_pubaddr | startswith("https://"))
-     then .ui_settings = (.ui_settings // {}) | .ui_settings.HTTPSUrl = $http_pubaddr
-     elif ($http_pubaddr | startswith("http://"))
-     then .ui_settings = (.ui_settings // {}) | .ui_settings.HTTPUrl = $http_pubaddr
+  | (if ($http_pubaddr[0] | startswith("https://"))
+     then .ui_settings = (.ui_settings // {}) | .ui_settings.HTTPSUrl = $http_pubaddr[0]
+     elif ($http_pubaddr[1] | startswith("http://"))
+     then .ui_settings = (.ui_settings // {}) | .ui_settings.HTTPUrl = $http_pubaddr[1]
      else .
      end)
   ' \
