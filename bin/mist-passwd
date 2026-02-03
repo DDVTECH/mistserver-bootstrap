@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mist-passwd - Change MistServer admin password
+#
+# MistServer stores passwords as MD5 hashes in the config file.
+# Changing password requires: stop → modify config → start
+# WARNING: This will kill all active streams!
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIST_BOOTSTRAP_ROOT="${MIST_BOOTSTRAP_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# If installed via symlink, read actual root from install marker
+if [ -f "/etc/mistserver/bootstrap-root" ]; then
+  MIST_BOOTSTRAP_ROOT="$(cat /etc/mistserver/bootstrap-root)"
+fi
+
+# Source shared libraries
+if [ -f "${MIST_BOOTSTRAP_ROOT}/lib/common.sh" ]; then
+  source "${MIST_BOOTSTRAP_ROOT}/lib/common.sh"
+  source "${MIST_BOOTSTRAP_ROOT}/lib/config.sh"
+  LOG_PREFIX="mist-passwd"
+  load_env
+else
+  echo "Error: Could not find lib/common.sh in ${MIST_BOOTSTRAP_ROOT}" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+Usage: mist-passwd [options]
+
+Change MistServer admin password.
+
+WARNING: This requires restarting MistServer, which will kill all active streams!
+
+Options:
+  -u, --user USERNAME    Username to change (default: admin)
+  -p, --password PASS    New password (will prompt if not provided)
+  -f, --force            Skip confirmation prompt
+  -h, --help             Show this help message
+
+Examples:
+  mist-passwd                      # Interactive password change for admin
+  mist-passwd -u admin -p newpass  # Non-interactive
+  mist-passwd --force              # Skip confirmation
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+compute_md5() {
+  local input="$1"
+  if command -v md5sum >/dev/null 2>&1; then
+    printf '%s' "${input}" | md5sum | cut -d' ' -f1
+  elif command -v md5 >/dev/null 2>&1; then
+    printf '%s' "${input}" | md5 -q
+  else
+    fail "No md5sum or md5 command found"
+  fi
+}
+
+get_config_path() {
+  # Check common locations
+  local paths=(
+    "/etc/mistserver.conf"
+    "/etc/mistserver/mistserver.conf"
+    "${HOME}/.config/mistserver/mistserver.conf"
+    "${MIST_BOOTSTRAP_ROOT}/configs/mistserver.conf"
+  )
+
+  for p in "${paths[@]}"; do
+    if [ -f "$p" ]; then
+      echo "$p"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+is_mist_running() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mistserver 2>/dev/null; then
+    return 0
+  elif pgrep -x "MistController" >/dev/null 2>&1; then
+    return 0
+  elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^mist$'; then
+    return 0
+  fi
+  return 1
+}
+
+stop_mist() {
+  log "Stopping MistServer..."
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mistserver 2>/dev/null; then
+    sudo systemctl stop mistserver
+  elif pgrep -x "MistController" >/dev/null 2>&1; then
+    sudo pkill -TERM MistController
+    sleep 2
+  elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^mist$'; then
+    docker stop mist
+  else
+    warn "MistServer doesn't appear to be running"
+  fi
+}
+
+start_mist() {
+  log "Starting MistServer..."
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q mistserver; then
+    sudo systemctl start mistserver
+  elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^mist$'; then
+    docker start mist
+  else
+    warn "Could not determine how to start MistServer"
+    warn "Please start it manually"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+USERNAME="admin"
+PASSWORD=""
+FORCE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|--user)
+      USERNAME="$2"
+      shift 2
+      ;;
+    -p|--password)
+      PASSWORD="$2"
+      shift 2
+      ;;
+    -f|--force)
+      FORCE=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown option: $1. Use --help for usage."
+      ;;
+  esac
+done
+
+# Check if running in Docker mode
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^mist$'; then
+  echo ""
+  warn "MistServer is running in Docker."
+  echo ""
+  echo "For Docker deployments, change password via environment variable:"
+  echo "  1. Edit .env: ADMIN_PASSWORD=your_new_password"
+  echo "  2. Restart:   docker compose down && docker compose up -d"
+  echo ""
+  exit 1
+fi
+
+# Find config file
+CONFIG_PATH=$(get_config_path) || fail "Could not find MistServer config file"
+log "Config file: ${CONFIG_PATH}"
+
+# Check write permissions before doing anything destructive
+if [ ! -w "${CONFIG_PATH}" ]; then
+  fail "Cannot write to ${CONFIG_PATH}. Run with sudo."
+fi
+
+# Check if jq is available
+require_command jq
+
+# Prompt for password if not provided
+if [ -z "${PASSWORD}" ]; then
+  echo -n "Enter new password for '${USERNAME}': "
+  read -rs PASSWORD
+  echo
+
+  if [ -z "${PASSWORD}" ]; then
+    fail "Password cannot be empty"
+  fi
+
+  echo -n "Confirm password: "
+  read -rs PASSWORD_CONFIRM
+  echo
+
+  if [ "${PASSWORD}" != "${PASSWORD_CONFIRM}" ]; then
+    fail "Passwords do not match"
+  fi
+fi
+
+# Confirm if MistServer is running
+if is_mist_running; then
+  if [ "${FORCE}" != "true" ]; then
+    echo ""
+    warn "MistServer is running."
+    warn "Changing password requires a restart, which will KILL ALL ACTIVE STREAMS!"
+    echo ""
+    echo -n "Continue? [y/N] "
+    read -r CONFIRM
+
+    if [[ ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
+      log "Aborted."
+      exit 0
+    fi
+  fi
+
+  MIST_WAS_RUNNING=true
+  stop_mist
+  sleep 1
+else
+  MIST_WAS_RUNNING=false
+fi
+
+# Compute MD5 hash
+PASSWORD_HASH=$(compute_md5 "${PASSWORD}")
+log "Password hash computed"
+
+# Update config
+log "Updating config..."
+
+# Create backup
+cp "${CONFIG_PATH}" "${CONFIG_PATH}.bak"
+log "Backup saved to ${CONFIG_PATH}.bak"
+
+# Update password in config using jq
+if ! jq --arg user "${USERNAME}" --arg hash "${PASSWORD_HASH}" \
+  '.account[$user].password = $hash' \
+  "${CONFIG_PATH}" > "${CONFIG_PATH}.tmp"; then
+  mv "${CONFIG_PATH}.bak" "${CONFIG_PATH}"
+  fail "Failed to update config"
+fi
+
+mv "${CONFIG_PATH}.tmp" "${CONFIG_PATH}"
+log "Config updated"
+
+# Restart if it was running
+if [ "${MIST_WAS_RUNNING}" = "true" ]; then
+  start_mist
+fi
+
+echo ""
+log "Password changed successfully for user '${USERNAME}'"

@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mist-https - Enable/disable HTTPS for MistServer via Caddy reverse proxy
+
+# Determine script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIST_BOOTSTRAP_ROOT="${MIST_BOOTSTRAP_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# If installed via symlink, read actual root from install marker
+if [ -f "/etc/mistserver/bootstrap-root" ]; then
+  MIST_BOOTSTRAP_ROOT="$(cat /etc/mistserver/bootstrap-root)"
+fi
+
+# Source shared libraries
+if [ -f "${MIST_BOOTSTRAP_ROOT}/lib/common.sh" ]; then
+  source "${MIST_BOOTSTRAP_ROOT}/lib/common.sh"
+  source "${MIST_BOOTSTRAP_ROOT}/lib/config.sh"
+  source "${MIST_BOOTSTRAP_ROOT}/lib/api.sh"
+  LOG_PREFIX="mist-https"
+  load_env
+else
+  echo "Error: Could not find lib/common.sh in ${MIST_BOOTSTRAP_ROOT}" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+Usage: mist-https <command> [options]
+
+Enable or disable HTTPS reverse proxy for MistServer using Caddy.
+
+Commands:
+  enable     Enable HTTPS with automatic TLS certificate
+  disable    Disable HTTPS, revert to direct access
+  status     Show current HTTPS configuration
+
+Options:
+  --domain DOMAIN      Domain name for TLS certificate (required for enable)
+  --mist-host HOST     MistServer host (default: localhost)
+  --mist-port PORT     MistServer API port (default: 4242)
+  --http-port PORT     MistServer HTTP port (default: 8080)
+  --config-only        Generate configs without starting/reloading services
+  --skip-mist-config   Don't update MistServer pubaddr configuration
+  -h, --help           Show this help message
+
+Examples:
+  mist-https enable --domain stream.example.com
+  mist-https enable --domain stream.example.com --mist-host 192.168.1.100
+  mist-https disable
+  mist-https status
+
+Notes:
+  - Caddy must be installed: apt install caddy
+  - The domain must already point to this server's IP address
+  - This script updates MistServer's pubaddr via API for correct embed codes
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_enable() {
+  local domain=""
+  local mist_host="${MIST_API_HOST:-localhost}"
+  local mist_port="${MIST_API_PORT:-4242}"
+  local http_port="${MIST_HTTP_PORT:-8080}"
+  local config_only=false
+  local skip_mist_config=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain)
+        domain="$2"
+        shift 2
+        ;;
+      --mist-host)
+        mist_host="$2"
+        shift 2
+        ;;
+      --mist-port)
+        mist_port="$2"
+        shift 2
+        ;;
+      --http-port)
+        http_port="$2"
+        shift 2
+        ;;
+      --config-only)
+        config_only=true
+        shift
+        ;;
+      --skip-mist-config)
+        skip_mist_config=true
+        shift
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  # Validate domain
+  if [ -z "${domain}" ]; then
+    fail "Domain required: --domain stream.example.com"
+  fi
+
+  # Check Caddy is installed
+  if ! command -v caddy >/dev/null 2>&1; then
+    fail "Caddy is not installed. Install with: sudo apt install caddy"
+  fi
+
+  # Check required tools
+  require_command "curl" "Install with: sudo apt install curl"
+  require_command "jq" "Install with: sudo apt install jq"
+
+  # Set API host/port for lib/api.sh
+  export MIST_API_HOST="${mist_host}"
+  export MIST_API_PORT="${mist_port}"
+
+  # Detect mode
+  local mode
+  mode="$(detect_mode)"
+  log "Detected mode: ${mode}"
+  log "Enabling HTTPS for domain: ${domain}"
+  log "MistServer target: ${mist_host}:${mist_port}"
+
+  # 1. Generate Caddyfile
+  log "Generating Caddyfile..."
+  DOMAIN="${domain}" \
+  MODE="${mode}" \
+  MIST_API_BACKEND="${mist_host}:${mist_port}" \
+  MIST_HTTP_BACKEND="${mist_host}:${http_port}" \
+  CADDYFILE_PATH="/etc/caddy/Caddyfile" \
+    "${MIST_BOOTSTRAP_ROOT}/scripts/gen_caddyfile.sh"
+
+  # 2. Update MistServer pubaddr via API (unless skipped)
+  if [ "${skip_mist_config}" = "false" ]; then
+    log "Checking MistServer connectivity..."
+
+    if mist_health >/dev/null 2>&1; then
+      log "Updating MistServer pubaddr via API..."
+
+      # Update HTTP pubaddr
+      if ! mist_set_pubaddr "${domain}" "${http_port}" >/dev/null; then
+        warn "Failed to update HTTP pubaddr"
+      fi
+
+      # Update WebRTC pubhost
+      if ! mist_set_pubhost "${domain}" >/dev/null; then
+        warn "Failed to update WebRTC pubhost"
+      fi
+
+      # Save config to disk
+      log "Saving MistServer config..."
+      if ! mist_save >/dev/null; then
+        warn "Failed to save config (changes may not persist across restart)"
+      fi
+
+      log "MistServer pubaddr updated successfully"
+    else
+      warn "MistServer not reachable at ${mist_host}:${mist_port}"
+      warn "You may need to manually set pubaddr in MistServer UI:"
+      warn "  HTTP protocol -> pubaddr -> [\"https://${domain}/view/\",\"http://${domain}:${http_port}\"]"
+      warn "  WebRTC protocol -> pubhost -> ${domain}"
+    fi
+  fi
+
+  # 3. Start/reload Caddy (unless config-only)
+  if [ "${config_only}" = "false" ]; then
+    log "Reloading Caddy..."
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+      sudo systemctl reload caddy
+    else
+      log "Starting Caddy service..."
+      sudo systemctl enable caddy
+      sudo systemctl start caddy
+    fi
+  fi
+
+  log ""
+  log "HTTPS enabled successfully!"
+  log ""
+  log "Access MistServer at:"
+  log "  Web UI:  https://${domain}/mist/"
+  log "  Streams: https://${domain}/hls/<streamname>/index.m3u8"
+  log "  Grafana: https://${domain}/grafana/ (if monitoring enabled)"
+}
+
+cmd_disable() {
+  local config_only=false
+  local skip_mist_config=false
+  local mist_host="${MIST_API_HOST:-localhost}"
+  local mist_port="${MIST_API_PORT:-4242}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config-only)
+        config_only=true
+        shift
+        ;;
+      --skip-mist-config)
+        skip_mist_config=true
+        shift
+        ;;
+      --mist-host)
+        mist_host="$2"
+        shift 2
+        ;;
+      --mist-port)
+        mist_port="$2"
+        shift 2
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  # Set API host/port for lib/api.sh
+  export MIST_API_HOST="${mist_host}"
+  export MIST_API_PORT="${mist_port}"
+
+  log "Disabling HTTPS..."
+
+  # Stop Caddy
+  if [ "${config_only}" = "false" ]; then
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+      log "Stopping Caddy service..."
+      sudo systemctl stop caddy
+      sudo systemctl disable caddy
+    fi
+  fi
+
+  # Clear MistServer pubaddr via API
+  if [ "${skip_mist_config}" = "false" ]; then
+    if mist_health >/dev/null 2>&1; then
+      log "Clearing MistServer pubaddr via API..."
+
+      mist_clear_pubaddr >/dev/null || true
+      mist_clear_pubhost >/dev/null || true
+      mist_save >/dev/null || true
+
+      log "MistServer pubaddr cleared"
+    else
+      warn "MistServer not reachable; pubaddr not cleared"
+    fi
+  fi
+
+  log ""
+  log "HTTPS disabled."
+  log ""
+  log "Access MistServer directly at:"
+  log "  Web UI: http://<server-ip>:4242"
+}
+
+cmd_status() {
+  local mist_host="${MIST_API_HOST:-localhost}"
+  local mist_port="${MIST_API_PORT:-4242}"
+
+  # Set API host/port for lib/api.sh
+  export MIST_API_HOST="${mist_host}"
+  export MIST_API_PORT="${mist_port}"
+
+  echo "HTTPS Status"
+  echo "============"
+  echo ""
+
+  # Check Caddy status
+  echo "Caddy:"
+  if command -v caddy >/dev/null 2>&1; then
+    echo "  Installed: yes"
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+      echo "  Status: running"
+    else
+      echo "  Status: stopped"
+    fi
+
+    # Check Caddyfile
+    if [ -f /etc/caddy/Caddyfile ]; then
+      echo "  Config: /etc/caddy/Caddyfile"
+      local domain
+      domain="$(grep -E '^[a-zA-Z0-9.-]+\s*\{' /etc/caddy/Caddyfile 2>/dev/null | head -1 | sed 's/[[:space:]]*{.*//' || true)"
+      if [ -n "${domain}" ] && [ "${domain}" != ":80" ]; then
+        echo "  Domain: ${domain}"
+      else
+        echo "  Domain: (none - HTTP only)"
+      fi
+    else
+      echo "  Config: not found"
+    fi
+  else
+    echo "  Installed: no"
+  fi
+
+  echo ""
+
+  # Check MistServer pubaddr via API
+  echo "MistServer:"
+  if mist_health >/dev/null 2>&1; then
+    echo "  Status: reachable at ${mist_host}:${mist_port}"
+
+    # Get current config via API
+    local config
+    config=$(mist_config 2>/dev/null || echo "{}")
+
+    # Extract HTTP pubaddr
+    local pubaddr
+    pubaddr=$(echo "${config}" | jq -r '.protocols[]? | select(.connector == "HTTP") | .pubaddr // empty' 2>/dev/null || true)
+    if [ -n "${pubaddr}" ] && [ "${pubaddr}" != "null" ]; then
+      echo "  HTTP pubaddr: ${pubaddr}"
+    else
+      echo "  HTTP pubaddr: (not set)"
+    fi
+
+    # Extract WebRTC pubhost
+    local pubhost
+    pubhost=$(echo "${config}" | jq -r '.protocols[]? | select(.connector == "WebRTC") | .pubhost // empty' 2>/dev/null || true)
+    if [ -n "${pubhost}" ] && [ "${pubhost}" != "null" ]; then
+      echo "  WebRTC pubhost: ${pubhost}"
+    else
+      echo "  WebRTC pubhost: (not set)"
+    fi
+  else
+    echo "  Status: not reachable at ${mist_host}:${mist_port}"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+case "${1:-}" in
+  enable)
+    shift
+    cmd_enable "$@"
+    ;;
+  disable)
+    shift
+    cmd_disable "$@"
+    ;;
+  status)
+    shift
+    cmd_status "$@"
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    fail "Unknown command: $1. Use --help for usage."
+    ;;
+esac

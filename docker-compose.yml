@@ -1,11 +1,13 @@
 services:
   mist:
     build:
-      context: ./mistserver
+      context: .
+      dockerfile: Dockerfile
     image: mistserver-bootstrap
     container_name: mist
     shm_size: 1gb
     environment:
+      MIST_BOOTSTRAP_ROOT: /opt/mist
       DOMAIN: ${DOMAIN:-}
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -19,6 +21,7 @@ services:
       - ./configs/mistserver.conf:/etc/mistserver.conf:rw
       - ./assets/vod:/video:rw
       - ./scripts:/scripts:ro
+      - ./lib:/opt/mist/lib:ro
       - mist-data:/var/mist
     ports:
       - "4242:4242"
@@ -45,10 +48,13 @@ services:
       - caddy
     volumes:
       - ./scripts:/scripts:ro
+      - ./lib:/opt/mist/lib:ro
       - caddy-data:/data
       - caddy-config:/config
     environment:
+      MIST_BOOTSTRAP_ROOT: /opt/mist
       DOMAIN: ${DOMAIN:-}
+      MODE: docker
     ports:
       - "80:80"
       - "443:443"
@@ -62,18 +68,20 @@ services:
     depends_on:
       - mist
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
     ports:
       - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - monitoring
 
   grafana:
-    image: grafana/grafana:10.4.3
+    image: grafana/grafana:11.2.2
     container_name: grafana
     environment:
       GF_SECURITY_ADMIN_USER: admin
@@ -85,8 +93,8 @@ services:
       GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/"
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "3000:3000"
     depends_on:

@@ -1,12 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONF_FILE="${CONF_FILE:-/etc/mistserver.conf}"
-TMP_FILE="$(mktemp)"
+# Determine script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIST_BOOTSTRAP_ROOT="${MIST_BOOTSTRAP_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 
-log() {
-  printf '[mist-config] %s\n' "$1"
-}
+# Source shared libraries if available
+if [ -f "${MIST_BOOTSTRAP_ROOT}/lib/common.sh" ]; then
+  # shellcheck source=../lib/common.sh
+  source "${MIST_BOOTSTRAP_ROOT}/lib/common.sh"
+  # shellcheck source=../lib/config.sh
+  source "${MIST_BOOTSTRAP_ROOT}/lib/config.sh"
+  LOG_PREFIX="mist-config"
+else
+  # Fallback logging for standalone use
+  log() { printf '[mist-config] %s\n' "$1"; }
+  warn() { printf '[mist-config][warn] %s\n' "$*" >&2; }
+  fail() { printf '[mist-config][error] %s\n' "$*" >&2; exit 1; }
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Accept config path as first argument, or use CONF_FILE env var, or auto-detect
+if [ -n "${1:-}" ]; then
+  CONF_FILE="$1"
+elif [ -n "${CONF_FILE:-}" ]; then
+  CONF_FILE="${CONF_FILE}"
+elif type get_config_path >/dev/null 2>&1; then
+  CONF_FILE="$(get_config_path)"
+else
+  # Default for Docker container
+  CONF_FILE="/etc/mistserver.conf"
+fi
+
+if [ ! -f "${CONF_FILE}" ]; then
+  fail "Config file not found: ${CONF_FILE}"
+fi
+
+TMP_FILE="$(mktemp)"
+trap 'rm -f "${TMP_FILE}"' EXIT
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment Variables
+# ─────────────────────────────────────────────────────────────────────────────
 
 : "${ADMIN_USER:=}"
 : "${ADMIN_PASSWORD:=}"
@@ -18,21 +56,38 @@ log() {
 : "${LOCATION_LON:=}"
 : "${PROMETHEUS_PATH:=}"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Computed Values
+# ─────────────────────────────────────────────────────────────────────────────
+
 ADMIN_HASH=""
 if [ -n "${ADMIN_PASSWORD}" ]; then
-  ADMIN_HASH="$(printf '%s' "${ADMIN_PASSWORD}" | md5sum | awk '{print $1}')"
+  if type hash_password >/dev/null 2>&1; then
+    ADMIN_HASH="$(hash_password "${ADMIN_PASSWORD}")"
+  else
+    ADMIN_HASH="$(printf '%s' "${ADMIN_PASSWORD}" | md5sum | awk '{print $1}')"
+  fi
 fi
 
 HTTP_PUBADDR=""
 WEBRTC_PUBHOST=""
-[ -n "${DOMAIN}" ] && HTTP_PUBADDR='["https://'"${DOMAIN}"'/view/","http://'"${DOMAIN}"':8080"]' && WEBRTC_PUBHOST="${DOMAIN}"
+if [ -n "${DOMAIN}" ]; then
+  HTTP_PUBADDR='["https://'"${DOMAIN}"'/view/","http://'"${DOMAIN}"':8080"]'
+  WEBRTC_PUBHOST="${DOMAIN}"
+fi
 
 DEFAULT_EXCEPTIONS='["::1","127.0.0.0/8","10.0.0.0/8","192.168.0.0/16","172.16.0.0/12"]'
 
 LIMIT_BYTES=""
 if [ -n "${BANDWIDTH_LIMIT_MBIT}" ] && [ "${BANDWIDTH_LIMIT_MBIT}" != "0" ]; then
-  LIMIT_BYTES=$(( ${BANDWIDTH_LIMIT_MBIT} * 125000 ))
+  LIMIT_BYTES=$(( BANDWIDTH_LIMIT_MBIT * 125000 ))
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+log "Config file: ${CONF_FILE}"
 
 if [ -n "${ADMIN_USER}" ] && [ -n "${ADMIN_HASH}" ]; then
   log "Setting admin user '${ADMIN_USER}' from environment."
@@ -80,11 +135,20 @@ else
   log "DOMAIN not set; leaving public endpoint URLs as-is."
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Apply Configuration with jq
+# ─────────────────────────────────────────────────────────────────────────────
+
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is required but not installed. Install with: apt install jq"
+fi
+
 jq \
   --arg admin_user "${ADMIN_USER}" \
   --arg admin_hash "${ADMIN_HASH}" \
-  --argjson http_pubaddr "${HTTP_PUBADDR}" \
+  --argjson http_pubaddr "${HTTP_PUBADDR:-null}" \
   --arg webrtc_pubhost "${WEBRTC_PUBHOST}" \
+  --arg domain "${DOMAIN}" \
   --arg prometheus_path "${PROMETHEUS_PATH}" \
   --arg bw_exclude "${BANDWIDTH_EXCLUDE_LOCAL}" \
   --arg default_exceptions "${DEFAULT_EXCEPTIONS}" \
@@ -121,26 +185,26 @@ jq \
           )
      else .
      end)
-  | (if (($http_pubaddr|length)>0) and (.config.protocols? // null) != null
+  | (if ($http_pubaddr != null) and (($http_pubaddr|length)>0) and (.config.protocols? // null) != null
      then .config.protocols = (.config.protocols
            | map(
-               if .connector == "HTTP" then .pubaddr = $http_pubaddr 
+               if .connector == "HTTP" then .pubaddr = $http_pubaddr
                elif .connector == "WebRTC" then .pubhost = $webrtc_pubhost
                else .
                end))
      else .
      end)
-  | (if ($http_pubaddr[0] | startswith("https://"))
-     then .ui_settings = (.ui_settings // {}) | .ui_settings.HTTPSUrl = $http_pubaddr[0]
-     elif ($http_pubaddr[1] | startswith("http://"))
-     then .ui_settings = (.ui_settings // {}) | .ui_settings.HTTPUrl = $http_pubaddr[1]
+  | (if ($domain|length) > 0
+     then .ui_settings = (.ui_settings // {})
+          | .ui_settings.HTTPSUrl = "https://\($domain)/view/"
+          | .ui_settings.HTTPUrl = "http://\($domain):8080/"
      else .
      end)
   ' \
   "${CONF_FILE}" > "${TMP_FILE}"
 
 cat "${TMP_FILE}" > "${CONF_FILE}"
-rm -f "${TMP_FILE}"
 chmod 0644 "${CONF_FILE}"
 
+log "Configuration updated successfully."
 exit 0

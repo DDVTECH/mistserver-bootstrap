@@ -76,4 +76,4 @@ VOLUME ["/var/mist"]
 
 EXPOSE 4242 8080 1935 5554 4200 8889/udp 18203/udp
 ENTRYPOINT ["/entrypoint.sh"]
-CMD [MistController -c /etc/mistserver.conf]
+CMD ["MistController", "-c", "/etc/mistserver.conf"]

@@ -1,11 +1,50 @@
-#!/usr/bin/env sh
+#!/bin/sh
 set -eu
 
+# gen_caddyfile.sh - Generate Caddyfile for MistServer reverse proxy
+# POSIX-sh compatible for Alpine/Docker use
+
+# Determine script directory
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MIST_BOOTSTRAP_ROOT="${MIST_BOOTSTRAP_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# Logging functions (standalone - don't source libs in Docker container)
+log() { printf '[caddyfile] %s\n' "$1"; }
+warn() { printf '[caddyfile][warn] %s\n' "$*" >&2; }
+
+# Configuration
 : "${DOMAIN:=}"
+: "${MODE:=docker}"
 
-mkdir -p /etc/caddy
+# Backend targets (configurable, with mode-aware defaults)
+if [ "${MODE}" = "docker" ]; then
+  MIST_API_BACKEND="${MIST_API_BACKEND:-${MIST_BACKEND:-mist:4242}}"
+  MIST_HTTP_BACKEND="${MIST_HTTP_BACKEND:-mist:8080}"
+  GRAFANA_BACKEND="${GRAFANA_BACKEND:-grafana:3000}"
+else
+  MIST_API_BACKEND="${MIST_API_BACKEND:-${MIST_BACKEND:-localhost:4242}}"
+  MIST_HTTP_BACKEND="${MIST_HTTP_BACKEND:-localhost:8080}"
+  GRAFANA_BACKEND="${GRAFANA_BACKEND:-localhost:3000}"
+fi
 
-routes='
+# Output path
+if [ "${MODE}" = "docker" ]; then
+  CADDYFILE_PATH="${CADDYFILE_PATH:-/etc/caddy/Caddyfile}"
+else
+  CADDYFILE_PATH="${CADDYFILE_PATH:-${MIST_BOOTSTRAP_ROOT}/configs/Caddyfile}"
+fi
+
+log "Mode: ${MODE}"
+log "MistServer API backend: ${MIST_API_BACKEND}"
+log "MistServer HTTP backend: ${MIST_HTTP_BACKEND}"
+log "Grafana backend: ${GRAFANA_BACKEND}"
+log "Output: ${CADDYFILE_PATH}"
+
+# Create output directory if needed
+mkdir -p "$(dirname "${CADDYFILE_PATH}")"
+
+# Build routes block
+routes="
 encode gzip
 log
 
@@ -13,7 +52,7 @@ log
 redir @mist_noslash /mist/ 308
 
 @ws_mist path /mist/ws*
-reverse_proxy @ws_mist mist:4242 {
+reverse_proxy @ws_mist ${MIST_API_BACKEND} {
   header_up Host {host}
   header_up X-Real-IP {remote}
   header_up X-Forwarded-For {remote}
@@ -24,27 +63,27 @@ reverse_proxy @ws_mist mist:4242 {
 }
 
 handle_path /mist/* {
-  reverse_proxy mist:4242
+  reverse_proxy ${MIST_API_BACKEND}
 }
 
 handle_path /view/* {
-  reverse_proxy mist:8080 {
-    header_up X-Mst-Path "{scheme}://{host}/view/"
+  reverse_proxy ${MIST_HTTP_BACKEND} {
+    header_up X-Mst-Path \"{scheme}://{host}/view/\"
   }
 }
 
 handle_path /hls/* {
   header {
     Access-Control-Allow-Origin *
-    Access-Control-Allow-Methods "GET, POST, OPTIONS"
-    Access-Control-Allow-Headers "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range"
-    Access-Control-Expose-Headers "Content-Length,Content-Range"
+    Access-Control-Allow-Methods \"GET, POST, OPTIONS\"
+    Access-Control-Allow-Headers \"DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range\"
+    Access-Control-Expose-Headers \"Content-Length,Content-Range\"
   }
-  reverse_proxy mist:8080
+  reverse_proxy ${MIST_HTTP_BACKEND}
 }
 
 handle_path /webrtc/* {
-  reverse_proxy mist:8080
+  reverse_proxy ${MIST_HTTP_BACKEND}
 }
 
 @grafana_noslash path /grafana
@@ -52,7 +91,7 @@ redir @grafana_noslash /grafana/ 308
 
 @grafana path /grafana*
 handle @grafana {
-  reverse_proxy grafana:3000 {
+  reverse_proxy ${GRAFANA_BACKEND} {
     header_up Host {host}
     header_up X-Forwarded-Host {host}
     header_up X-Forwarded-Proto {scheme}
@@ -61,25 +100,28 @@ handle @grafana {
 }
 
 handle {
-  respond "Not found" 404
+  respond \"Not found\" 404
 }
-'
+"
 
-if [ -n "$DOMAIN" ]; then
-  cat > /etc/caddy/Caddyfile <<EOF
-$DOMAIN {
-$routes
+# Write Caddyfile
+if [ -n "${DOMAIN}" ]; then
+  log "Domain: ${DOMAIN} (HTTPS + HTTP)"
+  cat > "${CADDYFILE_PATH}" <<EOF
+${DOMAIN} {
+${routes}
 }
 :80 {
-$routes
+${routes}
 }
 EOF
 else
-  cat > /etc/caddy/Caddyfile <<EOF
+  log "No domain set (HTTP only on :80)"
+  cat > "${CADDYFILE_PATH}" <<EOF
 :80 {
-$routes
+${routes}
 }
 EOF
 fi
 
-exit 0
+log "Caddyfile generated at ${CADDYFILE_PATH}"

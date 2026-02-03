@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mist-monitoring - Enable/disable Prometheus + Grafana monitoring for MistServer
+#
+# Uses the main docker-compose.yml but only starts monitoring services.
+# For native MistServer, generates prometheus config with host.docker.internal target.
+
+# Determine script directory and source libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIST_BOOTSTRAP_ROOT="${MIST_BOOTSTRAP_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# If installed via symlink, read actual root from install marker
+if [ -f "/etc/mistserver/bootstrap-root" ]; then
+  MIST_BOOTSTRAP_ROOT="$(cat /etc/mistserver/bootstrap-root)"
+fi
+
+# Source shared libraries
+if [ -f "${MIST_BOOTSTRAP_ROOT}/lib/common.sh" ]; then
+  source "${MIST_BOOTSTRAP_ROOT}/lib/common.sh"
+  source "${MIST_BOOTSTRAP_ROOT}/lib/config.sh"
+  LOG_PREFIX="mist-monitoring"
+  load_env
+else
+  echo "Error: Could not find lib/common.sh in ${MIST_BOOTSTRAP_ROOT}" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+Usage: mist-monitoring <command> [options]
+
+Enable or disable Prometheus + Grafana monitoring for MistServer.
+Uses Docker containers for the monitoring stack.
+
+Commands:
+  enable     Start Prometheus and Grafana containers
+  disable    Stop and remove monitoring containers
+  status     Show monitoring stack status
+
+Options:
+  --mist-target HOST:PORT   MistServer metrics target (default: auto-detect)
+  --grafana-port PORT       Local port for Grafana (default: 3000)
+  --prometheus-port PORT    Local port for Prometheus (default: 9090)
+  -h, --help                Show this help message
+
+Examples:
+  mist-monitoring enable
+  mist-monitoring enable --mist-target 192.168.1.100:4242
+  mist-monitoring disable
+  mist-monitoring status
+
+Notes:
+  - Requires Docker to be installed and running
+  - Access Grafana at http://localhost:3000 (or configured port)
+  - Default Grafana credentials: admin/admin
+  - A pre-built MistServer dashboard is automatically provisioned
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+COMPOSE_FILE="${MIST_BOOTSTRAP_ROOT}/docker-compose.yml"
+RUNTIME_DIR="${HOME}/.config/mistserver"
+RUNTIME_PROMETHEUS_CONFIG="${RUNTIME_DIR}/prometheus.yml"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_enable() {
+  local mist_target=""
+  local grafana_port="${GRAFANA_PORT:-3000}"
+  local prometheus_port="${PROMETHEUS_PORT:-9090}"
+  local native_mode=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mist-target)
+        mist_target="$2"
+        shift 2
+        ;;
+      --grafana-port)
+        grafana_port="$2"
+        shift 2
+        ;;
+      --prometheus-port)
+        prometheus_port="$2"
+        shift 2
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  # Check Docker is available
+  require_docker
+
+  # Check compose file exists
+  if [ ! -f "${COMPOSE_FILE}" ]; then
+    fail "docker-compose.yml not found at ${COMPOSE_FILE}"
+  fi
+
+  # Detect mode and determine target
+  local mode
+  mode="$(detect_mode)"
+
+  if [ -z "${mist_target}" ]; then
+    case "${mode}" in
+      docker)
+        # Check if mist container is running (full stack mode)
+        if docker ps --format '{{.Names}}' | grep -q '^mist$'; then
+          # Full stack is running, prometheus can use 'mist:4242'
+          mist_target="mist:${MIST_API_PORT:-4242}"
+          log "Detected Docker full stack mode"
+        else
+          # No mist container, use host.docker.internal for native MistServer
+          mist_target="host.docker.internal:${MIST_API_PORT:-4242}"
+          native_mode=true
+          log "Detected native MistServer mode"
+        fi
+        ;;
+      native)
+        mist_target="host.docker.internal:${MIST_API_PORT:-4242}"
+        native_mode=true
+        log "Detected native MistServer mode"
+        ;;
+      *)
+        mist_target="host.docker.internal:${MIST_API_PORT:-4242}"
+        native_mode=true
+        log "Unknown mode, assuming native MistServer"
+        ;;
+    esac
+  else
+    # User specified target, assume native mode
+    native_mode=true
+  fi
+
+  log "Starting monitoring stack..."
+  log "  MistServer target: ${mist_target}"
+  log "  Grafana port: ${grafana_port}"
+  log "  Prometheus port: ${prometheus_port}"
+
+  cd "${MIST_BOOTSTRAP_ROOT}"
+
+  if [ "${native_mode}" = "true" ]; then
+    # Native mode: generate custom prometheus config and use override file
+    log "Generating Prometheus config for native mode..."
+    mkdir -p "${RUNTIME_DIR}"
+
+    MIST_TARGET="${mist_target}" \
+      "${MIST_BOOTSTRAP_ROOT}/scripts/gen_prometheus_config.sh" "${RUNTIME_PROMETHEUS_CONFIG}"
+
+    # Create compose override file for native mode
+    local override_file="${RUNTIME_DIR}/docker-compose.override.yml"
+    cat > "${override_file}" <<EOF
+services:
+  prometheus:
+    volumes:
+      - ${RUNTIME_PROMETHEUS_CONFIG}:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+EOF
+
+    # Start only prometheus and grafana with custom prometheus config
+    log "Starting monitoring containers..."
+    GRAFANA_PORT="${grafana_port}" \
+    PROMETHEUS_PORT="${prometheus_port}" \
+      docker compose \
+        -f "${COMPOSE_FILE}" \
+        -f "${override_file}" \
+        up -d \
+        --no-deps \
+        prometheus grafana
+
+  else
+    # Docker full stack mode: use default prometheus config (targets mist:4242)
+    # Use --no-deps to avoid recreating mist container (preserves GPU settings)
+    log "Starting monitoring containers..."
+    GRAFANA_PORT="${grafana_port}" \
+    PROMETHEUS_PORT="${prometheus_port}" \
+      docker compose \
+        -f "${COMPOSE_FILE}" \
+        up -d \
+        --no-deps \
+        prometheus grafana
+  fi
+
+  log ""
+  log "Monitoring stack started!"
+  log ""
+  log "Access:"
+  log "  Grafana:    http://localhost:${grafana_port}"
+  log "  Prometheus: http://localhost:${prometheus_port}"
+  log ""
+  log "Default Grafana credentials: admin / admin"
+  log "A MistServer dashboard is pre-configured."
+}
+
+cmd_disable() {
+  log "Stopping monitoring stack..."
+
+  if [ -f "${COMPOSE_FILE}" ]; then
+    cd "${MIST_BOOTSTRAP_ROOT}"
+    docker compose -f "${COMPOSE_FILE}" stop prometheus grafana
+    docker compose -f "${COMPOSE_FILE}" rm -f prometheus grafana
+    log "Monitoring stack stopped."
+  else
+    log "docker-compose.yml not found."
+  fi
+}
+
+cmd_status() {
+  echo "Monitoring Stack Status"
+  echo "======================"
+  echo ""
+
+  # Check Prometheus
+  echo "Prometheus:"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'prometheus'; then
+    local prom_port
+    prom_port=$(docker port prometheus 9090 2>/dev/null | head -1 | cut -d: -f2 || echo "9090")
+    echo "  Status: running"
+    echo "  URL: http://localhost:${prom_port}"
+  else
+    echo "  Status: not running"
+  fi
+
+  echo ""
+
+  # Check Grafana
+  echo "Grafana:"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'grafana'; then
+    local grafana_port
+    grafana_port=$(docker port grafana 3000 2>/dev/null | head -1 | cut -d: -f2 || echo "3000")
+    echo "  Status: running"
+    echo "  URL: http://localhost:${grafana_port}"
+  else
+    echo "  Status: not running"
+  fi
+
+  echo ""
+
+  # Show prometheus target if running
+  if [ -f "${RUNTIME_PROMETHEUS_CONFIG}" ]; then
+    echo "Prometheus Config:"
+    echo "  Target: $(grep -A2 'targets:' "${RUNTIME_PROMETHEUS_CONFIG}" 2>/dev/null | tail -1 | tr -d ' -' || echo "unknown")"
+    echo "  Config: ${RUNTIME_PROMETHEUS_CONFIG}"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+case "${1:-}" in
+  enable)
+    shift
+    cmd_enable "$@"
+    ;;
+  disable)
+    shift
+    cmd_disable "$@"
+    ;;
+  status)
+    shift
+    cmd_status "$@"
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    fail "Unknown command: $1. Use --help for usage."
+    ;;
+esac

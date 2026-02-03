@@ -30,7 +30,7 @@ else
 UP_FLAG :=
 endif
 
-.PHONY: up down logs ps build pull preflight help
+.PHONY: up down logs ps build pull preflight install help
 
 up:
 ifneq ($(PREFLIGHT),false)
@@ -59,15 +59,32 @@ pull:
 preflight:
 	ENABLE_CADDY=$(CADDY) ./scripts/preflight.sh
 
+install:
+	./install.sh
+
 help:
-	@echo "MistServer bootstrap helpers"
+	@echo "MistServer Bootstrap"
+	@echo ""
+	@echo "Docker (full stack):"
 	@echo "  make up [CADDY=true] [GPU=true] [DETACH=true] [SERVICES=\"mist grafana\"]"
 	@echo "  make down"
 	@echo "  make logs [SERVICES=...]"
 	@echo "  make ps"
 	@echo "  make build"
+	@echo ""
+	@echo "Native installation:"
+	@echo "  make install         Install CLI tools to /usr/local/bin"
+	@echo ""
+	@echo "CLI tools (after 'make install'):"
+	@echo "  mist-install         Install MistServer (source build or binary)"
+	@echo "  mist-passwd          Change admin password (requires restart)"
+	@echo "  mist-https           Enable/disable HTTPS via Caddy"
+	@echo "  mist-monitoring      Enable/disable Prometheus + Grafana"
+	@echo "  mist-status          Show MistServer status"
+	@echo "  mist-videogen        Generate test video stream"
+	@echo ""
 	@echo "Flags:"
-	@echo "  CADDY=true        include reverse proxy profile"
-	@echo "  GPU=true          include docker-compose.gpu.yml overrides"
-	@echo "  PREFLIGHT=false   skip ./scripts/preflight.sh"
-	@echo "  DETACH=true       equivalent to docker compose up -d"
+	@echo "  CADDY=true           Include Caddy reverse proxy"
+	@echo "  GPU=true             Include GPU passthrough (Linux only)"
+	@echo "  PREFLIGHT=false      Skip preflight checks"
+	@echo "  DETACH=true          Run in background (-d)"

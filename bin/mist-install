@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mist-install - Install MistServer (source build or binary download)
+#
+# Default: Build from source with AV support enabled
+# Use --binary for quick pre-built download (no AV/GPU support)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIST_BOOTSTRAP_ROOT="${MIST_BOOTSTRAP_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# If installed via symlink, read actual root from install marker
+if [ -f "/etc/mistserver/bootstrap-root" ]; then
+  MIST_BOOTSTRAP_ROOT="$(cat /etc/mistserver/bootstrap-root)"
+fi
+
+# Source shared libraries
+if [ -f "${MIST_BOOTSTRAP_ROOT}/lib/common.sh" ]; then
+  source "${MIST_BOOTSTRAP_ROOT}/lib/common.sh"
+  LOG_PREFIX="mist-install"
+  load_env
+else
+  echo "Error: Could not find lib/common.sh in ${MIST_BOOTSTRAP_ROOT}" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+MIST_REPO="https://github.com/DDVTECH/mistserver.git"
+MIST_BINARY_BASE="https://r.mistserver.org/dl"
+MIST_INSTALL_DIR="/usr/bin"
+MIST_CONFIG_DIR="/etc/mistserver"
+MIST_CONFIG_FILE="${MIST_CONFIG_DIR}/mistserver.conf"
+MIST_SERVICE_FILE="/etc/systemd/system/mistserver.service"
+BUILD_DIR="/tmp/mistserver-build"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+Usage: mist-install [options] [command]
+
+Install MistServer natively (source build or binary download).
+
+Commands:
+  (default)    Build from source with AV support (recommended)
+  status       Show installed version and status
+  uninstall    Remove MistServer
+
+Options:
+  --binary              Download pre-built binary (quick, no AV/GPU support)
+  --version VERSION     Specific version (default: latest)
+  --branch BRANCH       Git branch for source build (default: master)
+  --tag TAG             Git tag for source build
+  --no-av               Disable AV support in source build
+  --auto-deps           Automatically install dependencies (requires sudo)
+  --check-deps          Only check dependencies, don't install
+  -h, --help            Show this help
+
+Examples:
+  mist-install                      # Build from source with AV (recommended)
+  mist-install --binary             # Quick: download pre-built binary
+  mist-install --binary --version 3.9.2
+  mist-install --tag 3.9.2          # Build specific release from source
+  mist-install status
+  mist-install uninstall
+
+Notes:
+  - Source build includes AV/GPU transcoding support
+  - Pre-built binaries from mistserver.org do NOT include AV support
+  - Requires sudo for installation to /usr/bin
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+detect_arch() {
+  local arch
+  arch=$(uname -m)
+  case "${arch}" in
+    x86_64|amd64)
+      echo "64"
+      ;;
+    aarch64|arm64)
+      echo "aarch64"
+      ;;
+    *)
+      fail "Unsupported architecture: ${arch}"
+      ;;
+  esac
+}
+
+detect_os() {
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    echo "${ID}"
+  elif [ -f /etc/debian_version ]; then
+    echo "debian"
+  elif [ -f /etc/redhat-release ]; then
+    echo "rhel"
+  else
+    echo "unknown"
+  fi
+}
+
+check_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
+run_sudo() {
+  if check_root; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependency Management
+# ─────────────────────────────────────────────────────────────────────────────
+
+RUNTIME_DEPS_DEB="libssl3 curl jq"
+RUNTIME_DEPS_AV_DEB="libavcodec-extra libavformat-extra libavutil-extra ffmpeg"
+BUILD_DEPS_DEB="build-essential cmake git meson ninja-build libssl-dev pkg-config python3 python3-pip"
+BUILD_DEPS_AV_DEB="libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev"
+
+check_deps() {
+  local mode="$1"  # "runtime" or "build"
+  local with_av="$2"  # "true" or "false"
+  local missing=""
+
+  local os
+  os=$(detect_os)
+
+  case "${os}" in
+    ubuntu|debian)
+      local deps="${RUNTIME_DEPS_DEB}"
+      if [ "${mode}" = "build" ]; then
+        deps="${BUILD_DEPS_DEB}"
+        if [ "${with_av}" = "true" ]; then
+          deps="${deps} ${BUILD_DEPS_AV_DEB}"
+        fi
+      elif [ "${with_av}" = "true" ]; then
+        deps="${deps} ${RUNTIME_DEPS_AV_DEB}"
+      fi
+
+      for pkg in ${deps}; do
+        if ! dpkg -l "${pkg}" 2>/dev/null | grep -q "^ii"; then
+          missing="${missing} ${pkg}"
+        fi
+      done
+      ;;
+    *)
+      warn "Dependency checking not implemented for ${os}"
+      return 0
+      ;;
+  esac
+
+  if [ -n "${missing}" ]; then
+    echo "${missing}"
+    return 1
+  fi
+  return 0
+}
+
+install_deps() {
+  local mode="$1"
+  local with_av="$2"
+
+  local os
+  os=$(detect_os)
+
+  case "${os}" in
+    ubuntu|debian)
+      local deps="${RUNTIME_DEPS_DEB}"
+      if [ "${mode}" = "build" ]; then
+        deps="${BUILD_DEPS_DEB}"
+        if [ "${with_av}" = "true" ]; then
+          deps="${deps} ${BUILD_DEPS_AV_DEB}"
+        fi
+      elif [ "${with_av}" = "true" ]; then
+        deps="${deps} ${RUNTIME_DEPS_AV_DEB}"
+      fi
+
+      log "Installing dependencies: ${deps}"
+      run_sudo apt-get update
+      run_sudo apt-get install -y ${deps}
+      ;;
+    *)
+      fail "Automatic dependency installation not supported for ${os}"
+      ;;
+  esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Installation Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+install_binary() {
+  local version="${1:-latest}"
+
+  local arch
+  arch=$(detect_arch)
+
+  local url="${MIST_BINARY_BASE}/mistserver_${arch}V${version}.tar.gz"
+
+  log "Downloading MistServer binary..."
+  log "  URL: ${url}"
+  log "  Architecture: ${arch}"
+
+  # Download to temp
+  local tmpfile="/tmp/mistserver_${arch}V${version}.tar.gz"
+  if ! curl -fSL "${url}" -o "${tmpfile}"; then
+    fail "Failed to download from ${url}"
+  fi
+
+  # Check if MistServer is running
+  local was_running=false
+  if pgrep -x MistController >/dev/null 2>&1; then
+    was_running=true
+    log "MistServer is running, will send USR1 for graceful reload"
+  fi
+
+  # Extract to /usr/bin
+  log "Installing binaries to ${MIST_INSTALL_DIR}..."
+  run_sudo tar -C "${MIST_INSTALL_DIR}" -xzf "${tmpfile}"
+
+  # Clean up
+  rm -f "${tmpfile}"
+
+  # Create config directory
+  run_sudo mkdir -p "${MIST_CONFIG_DIR}"
+
+  # Create default config if not exists
+  if [ ! -f "${MIST_CONFIG_FILE}" ]; then
+    log "Creating default config at ${MIST_CONFIG_FILE}"
+    run_sudo tee "${MIST_CONFIG_FILE}" > /dev/null <<'EOF'
+{
+  "config": {
+    "protocols": [
+      {"connector": "HTTP"},
+      {"connector": "RTMP"},
+      {"connector": "WebRTC"}
+    ]
+  }
+}
+EOF
+  fi
+
+  # Install systemd service (binary installs to MIST_INSTALL_DIR which is /usr/bin)
+  install_systemd_service "${MIST_INSTALL_DIR}"
+
+  # Handle running instance
+  if [ "${was_running}" = "true" ]; then
+    log "Sending USR1 signal for graceful reload..."
+    run_sudo pkill -USR1 -x MistController || true
+  else
+    # Start the service
+    log "Starting MistServer..."
+    run_sudo systemctl start mistserver
+  fi
+
+  log ""
+  log "MistServer installed successfully!"
+  log "  Version: ${version}"
+  log "  Binaries: ${MIST_INSTALL_DIR}/Mist*"
+  log "  Config: ${MIST_CONFIG_FILE}"
+  log "  Service: systemctl status mistserver"
+  log ""
+  log "Access the web UI at: http://localhost:4242"
+}
+
+install_source() {
+  local branch="${1:-master}"
+  local tag="${2:-}"
+  local with_av="${3:-true}"
+
+  log "Building MistServer from source..."
+  log "  Repository: ${MIST_REPO}"
+  if [ -n "${tag}" ]; then
+    log "  Tag: ${tag}"
+  else
+    log "  Branch: ${branch}"
+  fi
+  log "  AV support: ${with_av}"
+
+  # Clean build directory
+  rm -rf "${BUILD_DIR}"
+  mkdir -p "${BUILD_DIR}"
+
+  # Clone repository
+  log "Cloning repository..."
+  git clone "${MIST_REPO}" "${BUILD_DIR}/mistserver"
+  cd "${BUILD_DIR}/mistserver"
+
+  # Checkout branch or tag
+  if [ -n "${tag}" ]; then
+    git checkout "tags/${tag}" -b "build-${tag}"
+  else
+    git checkout "${branch}"
+  fi
+
+  # Build with meson
+  log "Configuring build..."
+  local meson_opts="--default-library static"
+  if [ "${with_av}" = "true" ]; then
+    meson_opts="${meson_opts} -DWITH_AV=true"
+  fi
+
+  # Check if pip needs --break-system-packages (Python 3.11+)
+  local pip_opts=""
+  if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
+    pip_opts="--break-system-packages"
+  fi
+
+  # Ensure meson is installed
+  if ! command -v meson >/dev/null 2>&1; then
+    log "Installing meson..."
+    run_sudo python3 -m pip install ${pip_opts} --no-cache-dir 'meson>=1.3.0'
+  fi
+
+  meson setup build ${meson_opts}
+
+  log "Building..."
+  ninja -C build
+
+  # Check if MistServer is running
+  local was_running=false
+  if pgrep -x MistController >/dev/null 2>&1; then
+    was_running=true
+    log "MistServer is running, will send USR1 for graceful reload"
+  fi
+
+  log "Installing..."
+  run_sudo ninja -C build install
+
+  # Create config directory
+  run_sudo mkdir -p "${MIST_CONFIG_DIR}"
+
+  # Create default config if not exists
+  if [ ! -f "${MIST_CONFIG_FILE}" ]; then
+    log "Creating default config at ${MIST_CONFIG_FILE}"
+    run_sudo tee "${MIST_CONFIG_FILE}" > /dev/null <<'EOF'
+{
+  "config": {
+    "protocols": [
+      {"connector": "HTTP"},
+      {"connector": "RTMP"},
+      {"connector": "WebRTC"}
+    ]
+  }
+}
+EOF
+  fi
+
+  # Install systemd service (meson installs to /usr/local/bin by default)
+  install_systemd_service "/usr/local/bin"
+
+  # Clean up build directory
+  rm -rf "${BUILD_DIR}"
+
+  # Handle running instance
+  if [ "${was_running}" = "true" ]; then
+    log "Sending USR1 signal for graceful reload..."
+    run_sudo pkill -USR1 -x MistController || true
+  else
+    # Start the service
+    log "Starting MistServer..."
+    run_sudo systemctl start mistserver
+  fi
+
+  log ""
+  log "MistServer built and installed successfully!"
+  log "  Binaries: /usr/local/bin/Mist*"
+  log "  Config: ${MIST_CONFIG_FILE}"
+  log "  Service: systemctl status mistserver"
+  log ""
+  log "Access the web UI at: http://localhost:4242"
+}
+
+install_systemd_service() {
+  local bin_dir="${1:-/usr/local/bin}"
+
+  log "Creating systemd service..."
+  log "  Binary path: ${bin_dir}/MistController"
+
+  run_sudo tee "${MIST_SERVICE_FILE}" > /dev/null <<EOF
+[Unit]
+Description=MistServer Media Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${bin_dir}/MistController -c ${MIST_CONFIG_FILE}
+ExecReload=/bin/kill -USR1 \$MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  run_sudo systemctl daemon-reload
+  run_sudo systemctl enable mistserver
+  log "Systemd service enabled"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_install() {
+  local binary_mode=false
+  local version="latest"
+  local branch="master"
+  local tag=""
+  local with_av=true
+  local auto_deps=false
+  local check_only=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --binary)
+        binary_mode=true
+        shift
+        ;;
+      --version)
+        version="$2"
+        shift 2
+        ;;
+      --branch)
+        branch="$2"
+        shift 2
+        ;;
+      --tag)
+        tag="$2"
+        shift 2
+        ;;
+      --no-av)
+        with_av=false
+        shift
+        ;;
+      --auto-deps)
+        auto_deps=true
+        shift
+        ;;
+      --check-deps)
+        check_only=true
+        shift
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  # Determine install mode
+  local dep_mode="build"
+  if [ "${binary_mode}" = "true" ]; then
+    dep_mode="runtime"
+    with_av=false  # Pre-built binaries don't have AV
+  fi
+
+  # Check dependencies
+  log "Checking dependencies..."
+  local missing
+  if missing=$(check_deps "${dep_mode}" "${with_av}"); then
+    log "All dependencies satisfied"
+  else
+    if [ "${check_only}" = "true" ]; then
+      log "Missing dependencies:${missing}"
+      exit 1
+    elif [ "${auto_deps}" = "true" ]; then
+      install_deps "${dep_mode}" "${with_av}"
+    else
+      echo ""
+      echo "Missing dependencies:${missing}"
+      echo ""
+      read -p "Install missing dependencies? [y/N] " -n 1 -r
+      echo ""
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        install_deps "${dep_mode}" "${with_av}"
+      else
+        fail "Cannot proceed without dependencies"
+      fi
+    fi
+  fi
+
+  # Install
+  if [ "${binary_mode}" = "true" ]; then
+    install_binary "${version}"
+  else
+    install_source "${branch}" "${tag}" "${with_av}"
+  fi
+}
+
+cmd_status() {
+  echo "MistServer Status"
+  echo "================="
+  echo ""
+
+  # Check if installed
+  local mist_bin=""
+  if [ -x "/usr/local/bin/MistController" ]; then
+    mist_bin="/usr/local/bin/MistController"
+  elif [ -x "/usr/bin/MistController" ]; then
+    mist_bin="/usr/bin/MistController"
+  fi
+
+  if [ -n "${mist_bin}" ]; then
+    echo "Installed: yes"
+    echo "Binary: ${mist_bin}"
+
+    # Get version
+    local version
+    version=$("${mist_bin}" --version 2>/dev/null | head -1 || echo "unknown")
+    echo "Version: ${version}"
+  else
+    echo "Installed: no"
+    echo ""
+    echo "Run 'mist-install' to install MistServer"
+    return
+  fi
+
+  echo ""
+
+  # Check service status
+  echo "Service:"
+  if systemctl is-active --quiet mistserver 2>/dev/null; then
+    echo "  Status: running"
+    echo "  PID: $(pgrep -x MistController || echo "unknown")"
+  elif systemctl is-enabled --quiet mistserver 2>/dev/null; then
+    echo "  Status: stopped (enabled)"
+  else
+    echo "  Status: not configured"
+  fi
+
+  echo ""
+
+  # Config
+  if [ -f "${MIST_CONFIG_FILE}" ]; then
+    echo "Config: ${MIST_CONFIG_FILE}"
+  fi
+}
+
+cmd_uninstall() {
+  log "Uninstalling MistServer..."
+
+  # Stop service
+  if systemctl is-active --quiet mistserver 2>/dev/null; then
+    log "Stopping MistServer..."
+    run_sudo systemctl stop mistserver
+  fi
+
+  # Disable service
+  if systemctl is-enabled --quiet mistserver 2>/dev/null; then
+    run_sudo systemctl disable mistserver
+  fi
+
+  # Remove service file
+  if [ -f "${MIST_SERVICE_FILE}" ]; then
+    run_sudo rm -f "${MIST_SERVICE_FILE}"
+    run_sudo systemctl daemon-reload
+  fi
+
+  # Remove binaries
+  log "Removing binaries..."
+  run_sudo rm -f /usr/local/bin/Mist* /usr/bin/Mist* 2>/dev/null || true
+
+  log ""
+  log "MistServer uninstalled."
+  log "Config preserved at: ${MIST_CONFIG_FILE}"
+  log "To remove config: sudo rm -rf ${MIST_CONFIG_DIR}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  status)
+    cmd_status
+    ;;
+  uninstall)
+    cmd_uninstall
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    cmd_install "$@"
+    ;;
+esac

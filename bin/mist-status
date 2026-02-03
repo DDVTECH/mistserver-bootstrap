@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mist-status - Show MistServer status and active streams
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIST_BOOTSTRAP_ROOT="${MIST_BOOTSTRAP_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# If installed via symlink, read actual root from install marker
+if [ -f "/etc/mistserver/bootstrap-root" ]; then
+  MIST_BOOTSTRAP_ROOT="$(cat /etc/mistserver/bootstrap-root)"
+fi
+
+# Source shared libraries
+if [ -f "${MIST_BOOTSTRAP_ROOT}/lib/common.sh" ]; then
+  source "${MIST_BOOTSTRAP_ROOT}/lib/common.sh"
+  source "${MIST_BOOTSTRAP_ROOT}/lib/api.sh"
+  LOG_PREFIX="mist-status"
+  load_env
+else
+  echo "Error: Could not find lib/common.sh in ${MIST_BOOTSTRAP_ROOT}" >&2
+  exit 1
+fi
+
+usage() {
+  cat <<EOF
+Usage: mist-status [command]
+
+Show MistServer status and active streams.
+
+Commands:
+  (none)     Show overview (streams, clients, server health)
+  streams    Show active streams with stats
+  clients    Show connected clients
+  pushes     Show active pushes
+  config     Show current configuration
+
+Options:
+  --host HOST    MistServer host (default: localhost)
+  --port PORT    MistServer API port (default: 4242)
+  --json         Output raw JSON
+  -h, --help     Show this help
+
+Examples:
+  mist-status
+  mist-status streams
+  mist-status clients --json
+EOF
+}
+
+# Parse global options
+JSON_OUTPUT=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)
+      export MIST_API_HOST="$2"
+      shift 2
+      ;;
+    --port)
+      export MIST_API_PORT="$2"
+      shift 2
+      ;;
+    --json)
+      JSON_OUTPUT=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      fail "Unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+MIST_API_HOST="${MIST_API_HOST:-localhost}"
+MIST_API_PORT="${MIST_API_PORT:-4242}"
+
+# Check connectivity first
+if ! mist_health >/dev/null 2>&1; then
+  echo "Error: MistServer not reachable at ${MIST_API_HOST}:${MIST_API_PORT}" >&2
+  exit 1
+fi
+
+cmd_overview() {
+  echo "MistServer Status"
+  echo "================="
+  echo ""
+  echo "Server: ${MIST_API_HOST}:${MIST_API_PORT}"
+  echo ""
+
+  # Get active streams
+  local active
+  active=$(mist_active_streams 2>/dev/null || echo "{}")
+
+  local stream_count
+  stream_count=$(echo "${active}" | jq 'length' 2>/dev/null || echo "0")
+  echo "Active Streams: ${stream_count}"
+
+  if [ "${stream_count}" != "0" ]; then
+    echo ""
+    echo "  Name                          Viewers   Bitrate"
+    echo "  ----                          -------   -------"
+    echo "${active}" | jq -r 'to_entries[] | "  \(.key | .[0:30] | . + " " * (30 - length))  \(.value.viewers // 0 | tostring | . + " " * (8 - length))  \(.value.total_kbps // 0)kbps"' 2>/dev/null || true
+  fi
+
+  echo ""
+
+  # Get client count
+  local clients
+  clients=$(mist_clients 2>/dev/null || echo "[]")
+  local client_count
+  client_count=$(echo "${clients}" | jq 'length' 2>/dev/null || echo "0")
+  echo "Connected Clients: ${client_count}"
+
+  # Get push count
+  local pushes
+  pushes=$(mist_push_list 2>/dev/null || echo "[]")
+  local push_count
+  push_count=$(echo "${pushes}" | jq 'length' 2>/dev/null || echo "0")
+  echo "Active Pushes: ${push_count}"
+}
+
+cmd_streams() {
+  local active
+  active=$(mist_active_streams 2>/dev/null || echo "{}")
+
+  if [ "${JSON_OUTPUT}" = "true" ]; then
+    echo "${active}" | jq '.'
+    return
+  fi
+
+  local count
+  count=$(echo "${active}" | jq 'length' 2>/dev/null || echo "0")
+
+  if [ "${count}" = "0" ]; then
+    echo "No active streams"
+    return
+  fi
+
+  echo "Active Streams (${count})"
+  echo ""
+  echo "${active}" | jq -r 'to_entries[] | "Stream: \(.key)\n  Viewers: \(.value.viewers // 0)\n  Inputs: \(.value.inputs // 0)\n  Outputs: \(.value.outputs // 0)\n  Bitrate: \(.value.total_kbps // 0) kbps\n  Health: \(.value.health // "unknown")\n"' 2>/dev/null || echo "${active}"
+}
+
+cmd_clients() {
+  local clients
+  clients=$(mist_clients 2>/dev/null || echo "[]")
+
+  if [ "${JSON_OUTPUT}" = "true" ]; then
+    echo "${clients}" | jq '.'
+    return
+  fi
+
+  local count
+  count=$(echo "${clients}" | jq 'length' 2>/dev/null || echo "0")
+
+  if [ "${count}" = "0" ]; then
+    echo "No connected clients"
+    return
+  fi
+
+  echo "Connected Clients (${count})"
+  echo ""
+  echo "  Stream                        Protocol    Host"
+  echo "  ------                        --------    ----"
+  echo "${clients}" | jq -r '.[] | "  \(.stream // "?" | .[0:30] | . + " " * (30 - length))  \(.protocol // "?" | .[0:10] | . + " " * (10 - length))  \(.host // "?")"' 2>/dev/null || echo "${clients}"
+}
+
+cmd_pushes() {
+  local pushes
+  pushes=$(mist_push_list 2>/dev/null || echo "[]")
+
+  if [ "${JSON_OUTPUT}" = "true" ]; then
+    echo "${pushes}" | jq '.'
+    return
+  fi
+
+  local count
+  count=$(echo "${pushes}" | jq 'length' 2>/dev/null || echo "0")
+
+  if [ "${count}" = "0" ]; then
+    echo "No active pushes"
+    return
+  fi
+
+  echo "Active Pushes (${count})"
+  echo ""
+  echo "${pushes}" | jq -r '.[] | "  [\(.[0])] \(.[1]) -> \(.[2])"' 2>/dev/null || echo "${pushes}"
+}
+
+cmd_config() {
+  local config
+  config=$(mist_config 2>/dev/null || echo "{}")
+
+  if [ "${JSON_OUTPUT}" = "true" ]; then
+    echo "${config}" | jq '.'
+    return
+  fi
+
+  echo "MistServer Configuration"
+  echo ""
+  echo "Server ID: $(echo "${config}" | jq -r '.serverid // "not set"')"
+  echo "Debug Level: $(echo "${config}" | jq -r '.debug // 0')"
+  echo "Prometheus: $(echo "${config}" | jq -r '.prometheus // "disabled"')"
+  echo ""
+  echo "Enabled Protocols:"
+  echo "${config}" | jq -r '.protocols[]? | "  - \(.connector)"' 2>/dev/null || true
+}
+
+# Main dispatch
+case "${1:-}" in
+  ""|overview)
+    cmd_overview
+    ;;
+  streams)
+    cmd_streams
+    ;;
+  clients)
+    cmd_clients
+    ;;
+  pushes)
+    cmd_pushes
+    ;;
+  config)
+    cmd_config
+    ;;
+  *)
+    fail "Unknown command: $1"
+    ;;
+esac
